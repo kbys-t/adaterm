@@ -5,7 +5,8 @@ import torch
 from torch.optim import Optimizer
 
 class AdaTerm(Optimizer):
-    r"""Implements an original optimizer
+    r"""Implements an original optimizer, so-called AdaTerm
+    https://arxiv.org/abs/2201.06714
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.9),
