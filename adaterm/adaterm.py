@@ -5,13 +5,12 @@ import torch
 from torch.optim import Optimizer
 
 class AdaTerm(Optimizer):
-    r"""Implements an original optimizer, so-called AdaTerm
-    https://arxiv.org/abs/2201.06714
+    r"""Implements an original optimizer
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.9),
                  eps=1e-5, weight_decay=0.0, amsgrad=False,
-                 ini_dof=0.0, uncentered=False,
+                 ini_dof=0.0, uncentered=False, adabias_corr=False,
                  k_dof=1.0, beta_dof=0.9):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -27,13 +26,15 @@ class AdaTerm(Optimizer):
             raise ValueError("Invalid ini_dof parameter: {}".format(ini_dof))
         if not isinstance(uncentered, bool):
             raise ValueError("Invalid uncentered parameter: {}".format(uncentered))
+        if not isinstance(adabias_corr, bool):
+            raise ValueError("Invalid adabias_corr parameter: {}".format(adabias_corr))
         if not ((k_dof > 0.0) or (k_dof == math.inf)):
             raise ValueError("Invalid degrees of freedom scale factor: {}".format(k_dof))
         if not 0.0 <= beta_dof <= 1.0:
             raise ValueError("Invalid beta parameter for dof optimisation: {}".format(beta_dof))
         defaults = dict(lr=lr, betas=betas, eps=eps,
                         weight_decay=weight_decay, amsgrad=amsgrad,
-                        ini_dof=ini_dof, uncentered=uncentered,
+                        ini_dof=ini_dof, uncentered=uncentered, adabias_corr=adabias_corr,
                         k_dof=k_dof, beta_dof=beta_dof, inf_dof=(k_dof == math.inf), optim_dof=(beta_dof < 1.0))
         super(AdaTerm, self).__init__(params, defaults)
 
@@ -65,6 +66,7 @@ class AdaTerm(Optimizer):
                 k_dof = group["k_dof"]
                 inf_dof = group["inf_dof"]
                 optim_dof = group["optim_dof"]
+                adabias_corr = group["adabias_corr"]
 
                 state = self.state[p]
 
@@ -77,8 +79,15 @@ class AdaTerm(Optimizer):
                         state["max_exp_var"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     if not inf_dof:
                         state["dof"] = max(k_dof + eps, group["ini_dof"])
+                    if adabias_corr:
+                        state["adabias_correction1"] = eps**2
+                        state["adabias_correction2"] = eps**2
+                    else:
+                        state["adabias_correction1"] = 1.0
+                        state["adabias_correction2"] = 1.0
 
                 exp_avg, exp_var = state["exp_avg"], state["exp_var"]
+                adabias_correction1, adabias_correction2 = state["adabias_correction1"], state["adabias_correction2"]
                 if amsgrad:
                     max_exp_var = state["max_exp_var"].mul_(amsgrad)
 
@@ -86,20 +95,20 @@ class AdaTerm(Optimizer):
                     grad.add_(p, alpha=group["weight_decay"])
 
                 # compute coeffs
-                diff = grad.sub(exp_avg).square_()
+                diff = grad.sub(exp_avg.div(adabias_correction1)).square_()
                 if inf_dof:
                     tau1, tau2 = 1.0 - beta1, 1.0 - beta2
                     diff.add_(eps**2)
                 else:
                     dof = state["dof"]
                     dd = dof + 1.0
-                    D_ = diff.div(exp_var).mean().item()
+                    D_ = diff.div(exp_var.div(adabias_correction2)).mean().item()
                     w_ = dd / (dof + D_)
                     w_max = dd / dof
                     tau = w_ / w_max
                     tau1 = tau * (1.0 - beta1)
                     tau2 = tau * (1.0 - beta2)
-                    diff.add_(diff.sub(exp_var, alpha=D_).div_(dof).clamp_(min=eps**2))
+                    diff.add_(diff.sub(exp_var.div(adabias_correction2), alpha=D_).div_(dof).clamp_(min=eps**2))
                     if optim_dof:
                         w_dof = w_ - math.log(max(w_, torch.finfo(torch.float32).tiny))
                         w_max = max(w_max - math.log(w_max), - math.log(torch.finfo(torch.float32).tiny))
@@ -114,8 +123,13 @@ class AdaTerm(Optimizer):
 
                 # update step and bias corrections
                 state["step"] += 1
-                bias_correction1 = 1.0 - beta1 ** state["step"]
-                bias_correction2 = 1.0 - beta2 ** state["step"]
+                if adabias_corr:
+                    state["adabias_correction1"] = adabias_correction1 * (1.0 - tau1) + tau1
+                    state["adabias_correction2"] = adabias_correction2 * (1.0 - tau2) + tau2
+                    bias_correction1, bias_correction2 = state["adabias_correction1"], state["adabias_correction2"]
+                else:
+                    bias_correction1 = 1.0 - beta1 ** state["step"]
+                    bias_correction2 = 1.0 - beta2 ** state["step"]
 
                 # set denominator
                 nume = exp_avg.div(bias_correction1)
