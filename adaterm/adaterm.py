@@ -5,8 +5,7 @@ import torch
 from torch.optim import Optimizer
 
 class AdaTerm(Optimizer):
-    r"""Implements an original optimizer, so-called AdaTerm
-    https://arxiv.org/abs/2201.06714
+    r"""Implements an original optimizer
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.9),
@@ -75,19 +74,16 @@ class AdaTerm(Optimizer):
                 if len(state) == 0:
                     state["step"] = 0
                     state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state["exp_var"] = torch.zeros_like(p, memory_format=torch.preserve_format).add_(eps**2)
+                    state["exp_var"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_eps"] = torch.zeros_like(p, memory_format=torch.preserve_format).add_(eps**2)
                     if amsgrad:
                         state["max_exp_var"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     if not inf_dof:
                         state["dof"] = max(k_dof + eps, group["ini_dof"])
-                    if adabias_corr:
-                        state["adabias_correction1"] = eps**2
-                        state["adabias_correction2"] = eps**2
-                    else:
-                        state["adabias_correction1"] = 1.0
-                        state["adabias_correction2"] = 1.0
+                    state["adabias_correction1"] = 0.0
+                    state["adabias_correction2"] = 0.0
 
-                exp_avg, exp_var = state["exp_avg"], state["exp_var"]
+                exp_avg, exp_var, exp_eps = state["exp_avg"], state["exp_var"], state["exp_eps"]
                 adabias_correction1, adabias_correction2 = state["adabias_correction1"], state["adabias_correction2"]
                 if amsgrad:
                     max_exp_var = state["max_exp_var"].mul_(amsgrad)
@@ -96,20 +92,21 @@ class AdaTerm(Optimizer):
                     grad.add_(p, alpha=group["weight_decay"])
 
                 # compute coeffs
-                diff = grad.sub(exp_avg.div(adabias_correction1)).square_()
+                diff = grad.sub(exp_avg).square_()
                 if inf_dof:
                     tau1, tau2 = 1.0 - beta1, 1.0 - beta2
-                    diff.add_(eps**2)
+                    delta = eps**2
                 else:
                     dof = state["dof"]
                     dd = dof + 1.0
-                    D_ = diff.div(exp_var.div(adabias_correction2)).mean().item()
+                    sigma_sq = exp_var.add(exp_eps)
+                    D_ = diff.div(sigma_sq).mean().item()
+                    delta = diff.sub(sigma_sq, alpha=D_).div_(dof).clamp_(min=eps**2)
                     w_ = dd / (dof + D_)
                     w_max = dd / dof
                     tau = w_ / w_max
                     tau1 = tau * (1.0 - beta1)
                     tau2 = tau * (1.0 - beta2)
-                    diff.add_(diff.sub(exp_var.div(adabias_correction2), alpha=D_).div_(dof).clamp_(min=eps**2))
                     if optim_dof:
                         w_dof = w_ - math.log(max(w_, torch.finfo(torch.float32).tiny))
                         w_max = max(w_max - math.log(w_max), - math.log(torch.finfo(torch.float32).tiny))
@@ -119,6 +116,7 @@ class AdaTerm(Optimizer):
                 # update statistics
                 exp_avg.mul_(1.0 - tau1).add_(grad, alpha=tau1)
                 exp_var.mul_(1.0 - tau2).add_(diff, alpha=tau2)
+                exp_eps.mul_(1.0 - tau2).add_(delta, alpha=tau2)
                 if (not inf_dof) and optim_dof:
                     state["dof"] = (1.0 - tau_dof) * dof + tau_dof * dof_tar
 
@@ -133,12 +131,13 @@ class AdaTerm(Optimizer):
                     bias_correction2 = 1.0 - beta2 ** state["step"]
 
                 # set denominator
-                nume = exp_avg.div(bias_correction1)
-                deno = exp_var.div(bias_correction2).addcmul_(nume, nume, value=group["uncentered"]).sqrt_()
+                deno = exp_var.addcmul(exp_avg, exp_avg, value=group["uncentered"])
                 if amsgrad:
                     deno = torch.maximum(max_exp_var, deno, out=max_exp_var)
 
                 # update parameter
+                nume = exp_avg.div(bias_correction1)
+                deno = deno.add(exp_eps).div_(bias_correction2).sqrt_()
                 p.addcdiv_(nume, deno, value=-group["lr"])
 
         return loss
